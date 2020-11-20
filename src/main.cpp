@@ -12,7 +12,7 @@
 #define soilSatPin A0
 
 // whether or not debug statements will print
-#define testing True
+#define testing
 
 // define the debug statement to print only when testing is defined
 #ifdef testing
@@ -32,6 +32,9 @@ int getWaterLevel();
 int getAverageWaterLevel(int samples);
 float getSaturation();
 void settingsUpdate(String &topic, String &payload);
+void publishTelemetry();
+void network_connect();
+
 //----- Global Variables -----
 int waterLevel          = 0;
 float saturation        = 0.0;
@@ -46,10 +49,9 @@ int maxValue            = dry - saturated;
 // ultrasonic sensor settings
 float sensorHeight      = 19.5;
 int minimumWaterLevel   = 20;
-int maxSanityFails      = 100;
-int ultrasonicSensorResolution = 0.03;   
+ 
 
-MQTTClient mqtt;
+MQTTClient mqtt(256);
 WiFiClient network;
 
 /**
@@ -58,6 +60,8 @@ WiFiClient network;
  * @returns void.
  */ 
 void setup() {
+  // TODO read from flash for default values
+
   float reservoirWidth  = 12.7; // default width in cm
   float reservoirLength = 12.7; // default length in cm
   float reservoirHeight = 17.5; // default height of reservoir in cm
@@ -81,13 +85,11 @@ void setup() {
   stopPump();
   delay(500);
 
-  // connect to network
-  WiFi.begin(ssid, pk);
-  while(WiFi.status() != WL_CONNECTED) delay(100);
-  DEBUG_ONELINE("Connected to network, IP: ");
-  DEBUG(WiFi.localIP());
-
-  // connect to MQTT
+  // connect to WiFi MQTT
+  mqtt.setOptions(60, true, 6000);
+  mqtt.begin(broker, network);
+  mqtt.onMessage(settingsUpdate);
+  network_connect();
 }
 
 
@@ -97,6 +99,12 @@ void setup() {
  * @returns void.
  */ 
 void loop() {
+  mqtt.loop();
+  delay(10);  
+
+  if (!mqtt.connected()) {
+    network_connect();
+  }
   waterLevel = getWaterLevel();
   saturation = getSaturation();
   DEBUG_ONELINE("Saturation: ");
@@ -120,19 +128,16 @@ void loop() {
   }
   
   stopPump();
-  int time = 80;
-  while(time > 0){
-    waterLevel = getAverageWaterLevel(10);
-    saturation = getSaturation();
-    DEBUG_ONELINE("Saturation: ");
-    DEBUG_ONELINE(saturation);
-    DEBUG("%");
-    DEBUG_ONELINE("Water Level: ");
-    DEBUG_ONELINE(waterLevel);
-    DEBUG("%");
-    time --;
-    delay(2000);
-  }
+  waterLevel = getAverageWaterLevel(10);
+  saturation = getSaturation();
+  DEBUG_ONELINE("Saturation: ");
+  DEBUG_ONELINE(saturation);
+  DEBUG("%");
+  DEBUG_ONELINE("Water Level: ");
+  DEBUG_ONELINE(waterLevel);
+  DEBUG("%");
+  publishTelemetry();
+  delay(sample_rate);
 }
 
 /**
@@ -162,10 +167,6 @@ inline void stopPump(){
  * @returns the distance read in centimeters
  */ 
 int getWaterLevel(){
-  static float lastLevel = -1.0;
-  static float lastSaneLevel = 0.0;
-  static float sanityFails = 0;
-
   long duration = 0;
   float level = 0;
 
@@ -183,26 +184,6 @@ int getWaterLevel(){
   level = sensorHeight - level;      // get current height of the water         
   level *= reservoir2D;              // convert to total volume left
   level /= reservoirVolume;          // get the percent left of the original volume
-  
-  if (lastLevel != -1 && fabs(lastLevel - level) > ultrasonicSensorResolution){ // prevent random spikes based on bad sensor readings
-    sanityFails ++;
-    DEBUG("Sanity fail");
-    if( sanityFails > 1 && sanityFails <= maxSanityFails) { // if we are have repeated sanity failues, start taking a weighted averaged based on the number of fails
-      lastLevel = (lastSaneLevel * (maxSanityFails - float(sanityFails)/float(maxSanityFails))) + (level *  (float(sanityFails)/float(maxSanityFails)));
-      lastLevel /= 100.0; // keeps the range within the proper decimal place
-      DEBUG_ONELINE("last level: ");
-      DEBUG(lastLevel);
-      DEBUG_ONELINE("current level: ");
-      DEBUG(level);
-    }
-    else if(sanityFails > maxSanityFails){ // if we surpass 100 fails, accept the current level as the last sane level
-      lastSaneLevel = lastLevel = level;
-    }
-
-    return int(lastSaneLevel * 100.0); 
-  }
-  lastSaneLevel = lastLevel = level;
-  sanityFails = 0;
   return int(level * 100.0);
 }
 
@@ -215,12 +196,47 @@ int getWaterLevel(){
  * @return the average value of the water level
  */
 int getAverageWaterLevel(int samples){
-  int waterLevel = 0;
-  for(int i = 0; i < samples; i++){
-     waterLevel += getWaterLevel();
-     delay(150);
+  static int sanityFails = 0;
+  float data[samples];
+  float outlierThreshold = 3;
+  float average = 0;
+  for(int i =0; i < samples; i ++){
+    float level = -1.0;
+    while(level < 0){ // case in which the sensor reading is a fluke
+      level = getWaterLevel();
+    }
+    data[i] = level;
+    delay(500);
   }
-  return waterLevel/samples;
+
+  // now we need to error check the data and ensure we eliminate any outliers the best we can.
+  bool outlier = true;
+  while(outlier){
+    outlier = false;
+    for(int i=0; i < samples; i ++) average += data[i];
+    average /= samples; // averaging
+
+    DEBUG("Outlier detection value: " + String(average));
+    for(int i=0; i < samples; i ++){
+      if(abs(data[i] - average) > outlierThreshold){
+        DEBUG("outlier detected: " + String(data[i]));
+        data[i] = average;
+        outlier = true;
+      }
+    }
+     average = 0;  // reseting average start value
+  }
+  // final summing of the data and averaging it.
+  for(int i=0; i < samples; i ++) average += data[i];
+  average /= samples; // average the data.
+  DEBUG("Final Distance: " + String(average));
+  if(abs(waterLevel - average) > 15 && sanityFails < 1){
+    DEBUG("Failed sanity check");
+    sanityFails ++;
+    return waterLevel;
+  }
+  sanityFails = 0;
+  return round(average);
 }
 
 /**
@@ -270,9 +286,10 @@ inline int max(int a, int b){
  */ 
 void settingsUpdate(String &topic, String &payload) {
   float resevoirWidth   = 0.0;
-  float reservoirlength = 0.0;
+  float reservoirLength = 0.0;
   float reservoirHeight = 0.0;
-  StaticJsonDocument<sizeof(payload)> json;
+  const size_t capacity = JSON_OBJECT_SIZE(8) + 30;
+  DynamicJsonDocument json(capacity);
 
   // deserialize our settings json string, if this fails, exit and return to main loop
   DeserializationError err = deserializeJson(json, payload);
@@ -282,27 +299,54 @@ void settingsUpdate(String &topic, String &payload) {
     return;
   }
   Serial.println("incoming: " + topic + " - " + payload);
+
+  // apply settings
+  resevoirWidth     = json["rw"];
+  reservoirLength   = json["rl"];
+  reservoir2D       = resevoirWidth * reservoirLength;
+  reservoirHeight   = json["rh"];
+  reservoirVolume   = reservoir2D * reservoirHeight;
+  minimumSaturation = json["ms"];
+  sensorHeight      = json["sh"];
+  minimumWaterLevel = json["ml"];
+  dry               = json["dr"];
+  saturated         = json["st"];
+
+  // TODO store these values in flash for reload on POR
 }
 
 /**
- * MQTT connection setup.
+ * WiFi/MQTT connection setup.
  * 
- * @param willTopic MQTT will topic
- * @param broker MQTT broker IP/Hostname
- * @param clientID unique ID for this device
- * @param mqttUser MQTT username
- * @param mqttPass MQTT password
  * @returns void.
  */ 
-void mqtt_connect(char* willTopic, char* broker, char* clientID, char* mqttUser, char* mqttPass){
-  mqtt.setWill(willTopic, "offline", true, 0);
-  mqtt.setOptions(60, true, 6000);
-  mqtt.begin(broker, network);
+void network_connect(){
+
+  if(WiFi.status() != WL_CONNECTED){
+    WiFi.begin(ssid, pk);
+    while(WiFi.status() != WL_CONNECTED) delay(100);
+    DEBUG_ONELINE("Connected to network, IP: ");
+    DEBUG(WiFi.localIP());
+  }
+  
+  mqtt.setWill(stateTopic, "Offline", true, 0);
   DEBUG_ONELINE("Connecting to MQTT Broker: ");
   DEBUG(broker);
-  while(!mqtt.connect(clientID, mqttUser, mqttPass)){
+  while(!mqtt.connect(mqttID, mqttUser, mqttPass)){
     delay(500);
   }
-  mqtt.publish(willTopic, "online", true, 0); // birth message
+
   DEBUG("Connected to MQTT!");
+  mqtt.subscribe(settingsTopic);
+  mqtt.publish(stateTopic, String("Online"), true, 2);
+}
+
+void publishTelemetry(){
+  char buffer[32];
+  String publish;
+  sprintf(buffer, "{\"wtr_lvl\": %d, \"sat\": %d}", waterLevel, int(saturation));
+  publish = String(buffer);
+  DEBUG_ONELINE("JSON to publish: ");
+  DEBUG(publish);
+  mqtt.publish(attributesTopic, publish, true, 2);
 }
