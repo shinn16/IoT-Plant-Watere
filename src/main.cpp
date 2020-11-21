@@ -6,9 +6,9 @@
 #include "settings.hpp"
 
 // GPIO pins
-#define trigPin D1
-#define echoPin D2
-#define relay D4
+#define trigPin 5
+#define echoPin 4
+#define relay 2
 #define soilSatPin A0
 
 // whether or not debug statements will print
@@ -34,21 +34,28 @@ float getSaturation();
 void settingsUpdate(String &topic, String &payload);
 void publishTelemetry();
 void network_connect();
+uint32_t calculateCRC32(const uint8_t *data, size_t length);
+
 
 //----- Global Variables -----
 int waterLevel          = 0;
 float saturation        = 0.0;
-// reservoir settings
-float reservoirVolume   = 0.0;
-float reservoir2D       = 0.0;
-// soil sensor settings
-float minimumSaturation = 20.0;
-int dry                 = 850;
-int saturated           = 445;
-int maxValue            = dry - saturated;
-// ultrasonic sensor settings
-float sensorHeight      = 19.5;
-int minimumWaterLevel   = 20;
+
+struct {
+  // crc for data validation on reset
+  uint32_t crc32;   
+  // reservoir settings
+  float reservoirVolume;
+  float reservoir2D; 
+  // soil sensor settings
+  float minimumSaturation;
+  int dry;
+  int saturated;
+  int maxValue;
+  // ultrasonic sensor settings
+  float sensorHeight;
+  int minimumWaterLevel;
+} settings;
  
 
 MQTTClient mqtt(256);
@@ -60,22 +67,64 @@ WiFiClient network;
  * @returns void.
  */ 
 void setup() {
-  // TODO read from flash for default values
-
-  float reservoirWidth  = 12.7; // default width in cm
-  float reservoirLength = 12.7; // default length in cm
-  float reservoirHeight = 17.5; // default height of reservoir in cm
-
-  reservoir2D     = reservoirWidth * reservoirLength;
-  reservoirVolume = reservoir2D * reservoirHeight;
-
-  DEBUG_ONELINE("Resevoir Volume: ");
-  DEBUG(reservoirVolume);
 
   #ifdef testing
     Serial.begin(9600);
   #endif
   DEBUG("Hello world");
+
+  if(ESP.rtcUserMemoryRead(0, (uint32_t*) &settings, sizeof(settings))) {
+    // Calculate the CRC of what we just read from RTC memory, but skip the first 4 bytes as that's the checksum itself.
+    uint32_t crc = calculateCRC32( ((uint8_t*) &settings) + 4, sizeof(settings) - 4 );
+    if(crc == settings.crc32) {
+      DEBUG("Restored settings");
+    }else{
+      /**
+       * Here is where you should put your default settings.
+       */ 
+      DEBUG("Failed to restore settings");
+      float reservoirWidth  = 12.7; // default width in cm
+      float reservoirLength = 12.7; // default length in cm
+      float reservoirHeight = 17.5; // default height of reservoir in cm
+
+      settings.reservoir2D     = reservoirWidth * reservoirLength;
+      settings.reservoirVolume = settings.reservoir2D * reservoirHeight;
+      
+      // soil sensor settings
+      settings.minimumSaturation   = 20.0;
+      settings.dry                 = 850;
+      settings.saturated           = 445;
+      settings.maxValue            = settings.dry - settings.saturated;
+
+      // ultra sonic sensor water level settings
+      settings.sensorHeight        = 19.5;
+      settings.minimumWaterLevel   = 20;
+    }
+  }
+  // cacluate checksum. The =/- 4 skips the checksum in the struct
+  settings.crc32 = calculateCRC32(((uint8_t*) &settings) + 4, sizeof(settings) - 4); 
+  ESP.rtcUserMemoryWrite(0, (uint32_t*) &settings, sizeof(settings));
+  DEBUG("==========================================");
+  DEBUG("Applied settings:");
+  DEBUG_ONELINE("\tReservoir Volume: ");
+  DEBUG(settings.reservoirVolume);
+  DEBUG("\tSoil Sat Sensor:");
+  DEBUG_ONELINE("\t\tminimumSaturation: ");
+  DEBUG(settings.minimumSaturation);
+  DEBUG_ONELINE("\t\tdry: ");
+  DEBUG(settings.dry);
+  DEBUG_ONELINE("\t\tsaturated: ");
+  DEBUG(settings.saturated);
+  DEBUG_ONELINE("\t\tmaxValue: ");
+  DEBUG(settings.maxValue);
+  DEBUG("\tUltrasonic Sensor:");
+  DEBUG_ONELINE("\t\tsensorHeight: ");
+  DEBUG(settings.sensorHeight);
+  DEBUG_ONELINE("\t\tminimumWaterLevel: ");
+  DEBUG(settings.minimumWaterLevel);
+  DEBUG("==========================================");
+
+
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   pinMode(relay, OUTPUT);
@@ -114,7 +163,7 @@ void loop() {
   DEBUG_ONELINE(waterLevel);
   DEBUG("%");
 
-  while(saturation <  minimumSaturation && waterLevel > minimumWaterLevel){
+  while(saturation <  settings.minimumSaturation && waterLevel > settings.minimumWaterLevel){
     startPump();
     waterLevel = getWaterLevel();
     saturation = getSaturation();
@@ -181,9 +230,9 @@ int getWaterLevel(){
 
   // calculate distance
   level = (float(duration) / 29.0)/ 2.0;  // get the height of the water left in cm
-  level = sensorHeight - level;      // get current height of the water         
-  level *= reservoir2D;              // convert to total volume left
-  level /= reservoirVolume;          // get the percent left of the original volume
+  level = settings.sensorHeight - level;      // get current height of the water         
+  level *= settings.reservoir2D;              // convert to total volume left
+  level /= settings.reservoirVolume;          // get the percent left of the original volume
   return int(level * 100.0);
 }
 
@@ -248,10 +297,10 @@ float getSaturation(){
   int rawReading = 0;
 
   rawReading = analogRead(soilSatPin);
-  rawReading -= saturated;                // subract the lowest value it should ever be
+  rawReading -= settings.saturated;                // subract the lowest value it should ever be
   rawReading = max(rawReading, 0);        // if somehow we get something lower, rewrite to 0
-  rawReading = min(rawReading, maxValue); // if the value is greater than the max, make it the max
-  return float(100.0 - ((float(rawReading)/float(maxValue)) * 100.0)); // return the saturation as a percent
+  rawReading = min(rawReading, settings.maxValue); // if the value is greater than the max, make it the max
+  return float(100.0 - ((float(rawReading)/float(settings.maxValue)) * 100.0)); // return the saturation as a percent
 }
 
 /**
@@ -298,21 +347,23 @@ void settingsUpdate(String &topic, String &payload) {
     DEBUG(err.c_str());
     return;
   }
-  Serial.println("incoming: " + topic + " - " + payload);
+  DEBUG("incoming: " + topic + " - " + payload);
 
   // apply settings
-  resevoirWidth     = json["rw"];
-  reservoirLength   = json["rl"];
-  reservoir2D       = resevoirWidth * reservoirLength;
-  reservoirHeight   = json["rh"];
-  reservoirVolume   = reservoir2D * reservoirHeight;
-  minimumSaturation = json["ms"];
-  sensorHeight      = json["sh"];
-  minimumWaterLevel = json["ml"];
-  dry               = json["dr"];
-  saturated         = json["st"];
+  resevoirWidth              = json["rw"];
+  reservoirLength            = json["rl"];
+  settings.reservoir2D       = resevoirWidth * reservoirLength;
+  reservoirHeight            = json["rh"];
+  settings.reservoirVolume   = settings.reservoir2D * reservoirHeight;
+  settings.minimumSaturation = json["ms"];
+  settings.sensorHeight      = json["sh"];
+  settings.minimumWaterLevel = json["ml"];
+  settings.dry               = json["dr"];
+  settings.saturated         = json["st"];
+  settings.maxValue          = settings.dry - settings.saturated;
 
-  // TODO store these values in flash for reload on POR
+  settings.crc32 = calculateCRC32(((uint8_t*) &settings) + 4, sizeof(settings) - 4); 
+  ESP.rtcUserMemoryWrite(0, (uint32_t*) &settings, sizeof(settings));
 }
 
 /**
@@ -341,6 +392,11 @@ void network_connect(){
   mqtt.publish(stateTopic, String("Online"), true, 2);
 }
 
+/**\
+ * Published telemetry over MQTT.
+ * 
+ * @returns void.
+ */
 void publishTelemetry(){
   char buffer[32];
   String publish;
@@ -349,4 +405,30 @@ void publishTelemetry(){
   DEBUG_ONELINE("JSON to publish: ");
   DEBUG(publish);
   mqtt.publish(attributesTopic, publish, true, 2);
+}
+
+/**
+ * Calculates the crc value of the settings..
+ * 
+ * @param data data to perform crc check on
+ * @param length size of the data
+ * @returns crc32
+ */
+uint32_t calculateCRC32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xffffffff;
+  while(length--) {
+    uint8_t c = *data++;
+    for(uint32_t i = 0x80; i > 0; i >>= 1) {
+      bool bit = crc & 0x80000000;
+      if(c & i) {
+        bit = !bit;
+      }
+
+      crc <<= 1;
+      if(bit) {
+        crc ^= 0x04c11db7;
+      }
+    }
+  }
+  return crc;
 }
